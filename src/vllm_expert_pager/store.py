@@ -121,7 +121,9 @@ static double now(void) {
 }
 
 static void pause_or_yield(long *spins) {
-  if (++*spins > 200000) { sched_yield(); *spins = 0; } else _mm_pause();
+  (void)spins;
+  struct timespec ts = {0, 100000}; /* 100 us */
+  while (nanosleep(&ts, &ts) != 0 && errno == EINTR) { }
 }
 
 static void fail(ssd_t *s, const char *fmt, ...) {
