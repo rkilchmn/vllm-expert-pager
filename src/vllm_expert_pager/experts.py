@@ -36,6 +36,21 @@ from vllm_expert_pager.table import ExpertTable
 # WARNING, and every info message is dropped.
 logger = init_logger(f"vllm.{__name__}")
 
+# Monkey-patch flashinfer's reorder_w1w3_to_w3w1 to handle non-contiguous tensors
+# (expert pager uses expand() which creates non-contiguous views)
+try:
+    from vllm.model_executor.layers.quantization.utils.flashinfer_fp4_moe import reorder_w1w3_to_w3w1 as _orig_reorder_w1w3_to_w3w1
+    def _patched_reorder_w1w3_to_w3w1(weight: torch.Tensor, scale: torch.Tensor, dim: int = -2):
+        if not weight.is_contiguous():
+            weight = weight.contiguous()
+        if not scale.is_contiguous():
+            scale = scale.contiguous()
+        return _orig_reorder_w1w3_to_w3w1(weight, scale, dim)
+    import vllm.model_executor.layers.quantization.utils.flashinfer_fp4_moe as _fi_mod
+    _fi_mod.reorder_w1w3_to_w3w1 = _patched_reorder_w1w3_to_w3w1
+except Exception as _e:
+    logger.warning(f"Failed to patch reorder_w1w3_to_w3w1: {_e}")
+
 # Number of cache slots per layer. One slot holds one expert (about 3 MiB for
 # 35B-A3B).
 CACHE_SLOTS = int(os.environ.get("VLLM_EXPERT_PAGER_CACHE_SLOTS", "32"))
@@ -103,11 +118,9 @@ class ExpertPagerRoutedExperts(RoutedExperts):
                 f"parallelism (local={self.local_num_experts}, "
                 f"global={self.global_num_experts})"
             )
-        if self.moe_config.moe_parallel_config.tp_size != 1:
-            raise RuntimeError(
-                f"{self.layer_name}: vllm-expert-pager does not support tensor "
-                "parallelism"
-            )
+        # TP is supported: each rank builds its own Store with per-rank row
+        # sizes (intermediate_size_per_partition), and each rank pages its own
+        # (sharded) rows. The EP guard above still applies.
         E = self.global_num_experts
         params = {name: getattr(self, name) for name in PARAMS}
 
@@ -129,6 +142,9 @@ class ExpertPagerRoutedExperts(RoutedExperts):
                     f"got {COMPRESS!r}"
                 )
             compress = R < E if COMPRESS == "auto" else COMPRESS == "on"
+            # TP: each rank has its own paging file
+            tp_rank = self.moe_config.tp_rank
+            rank_path = f"{SSD_PATH}.rank{tp_rank}" if SSD_PATH else None
             _store = Store(
                 num_layers=get_current_vllm_config().model_config.hf_text_config.num_hidden_layers,
                 num_experts=E,
@@ -141,7 +157,7 @@ class ExpertPagerRoutedExperts(RoutedExperts):
                 },
                 compress=compress,
                 pitch_ratio=PITCH_RATIO,
-                path=SSD_PATH,
+                path=rank_path,
                 device=params["w13_weight"].device,
             )
         self._expert_pager_store = _store
@@ -198,18 +214,43 @@ class ExpertPagerRoutedExperts(RoutedExperts):
         expert_id: int,
         return_success: bool = False,
     ) -> bool | None:
+        # TP sharding: the checkpoint has full weights, each rank loads its shard.
+        tp_rank = self.moe_config.tp_rank
+        tp_size = self.moe_config.moe_parallel_config.tp_size
+
         if param is self.w13_weight:
-            N, H = self.intermediate_size_per_partition, self.hidden_size
+            # Use param's actual shape (packed format for NVFP4).
+            # param.shape = [num_experts, 2 * intermediate_size_per_partition, hidden_size // 2]
+            _, N2, H_packed = param.shape
+            N = N2 // 2  # intermediate_size_per_partition
             buf, seen = self._expert_pager_stage.setdefault(
                 expert_id,
                 (
-                    torch.empty((2 * N, H), dtype=loaded_weight.dtype, device="cpu"),
+                    torch.empty((N2, H_packed), dtype=loaded_weight.dtype, device="cpu"),
                     set(),
                 ),
             )
-            # w1 (gate) goes in the first half, w3 (up) in the second. Same as
-            # RoutedExperts._load_w13.
-            half = 0 if shard_id == "w1" else N
+            # Checkpoint has full intermediate_size; shard along dim 0.
+            if loaded_weight.ndim > 0 and tp_size > 1:
+                loaded_per_rank = loaded_weight.shape[0] // tp_size
+                start_offset = loaded_per_rank * tp_rank
+                available = loaded_weight.shape[0] - start_offset
+                if available > 0:
+                    narrow_size = min(loaded_per_rank, available)
+                    loaded_weight = loaded_weight.narrow(0, start_offset, narrow_size)
+            # Row order must match the kernel that will read the publish slab.
+            # The direct-load path runs convert_to_nvfp4_moe_kernel_format(),
+            # which reorders [w1; w3] to [w3; w1] in place for the FlashInfer
+            # NVFP4 MoE backends. The pager bypasses that (the param content is
+            # a placeholder), so assemble the store record in the kernel's
+            # order here, mirroring the same condition.
+            backend = getattr(self.quant_method, "nvfp4_backend", None)
+            backend_v = getattr(backend, "value", backend)
+            fi_w3w1 = (
+                backend_v in ("FLASHINFER_CUTLASS", "FLASHINFER_TRTLLM", "FLASHINFER_B12X")
+                and getattr(self.moe_config, "is_act_and_mul", True)
+            )
+            half = (N if shard_id == "w1" else 0) if fi_w3w1 else (0 if shard_id == "w1" else N)
             buf[half : half + N].copy_(loaded_weight)
             seen.add(shard_id)
             if seen != {"w1", "w3"}:
@@ -219,6 +260,15 @@ class ExpertPagerRoutedExperts(RoutedExperts):
                 self._expert_pager_layer, expert_id, "w13_weight", buf
             )
         elif param is self.w2_weight:
+            # param.shape = [num_experts, hidden_size, intermediate_size_per_partition // 2]
+            # Checkpoint has full intermediate_size; shard along dim 1 (input dim).
+            if loaded_weight.ndim > 0 and tp_size > 1:
+                loaded_per_rank = loaded_weight.shape[1] // tp_size
+                start_offset = loaded_per_rank * tp_rank
+                available = loaded_weight.shape[1] - start_offset
+                if available > 0:
+                    narrow_size = min(loaded_per_rank, available)
+                    loaded_weight = loaded_weight.narrow(1, start_offset, narrow_size)
             self._expert_pager_store.write(
                 self._expert_pager_layer, expert_id, "w2_weight", loaded_weight
             )
@@ -272,11 +322,15 @@ class ExpertPagerRoutedExperts(RoutedExperts):
         # together with the weights.
         scale_name = getattr(self.quant_method, "weight_scale_name", None)
         if scale_name is None:
-            raise RuntimeError(
-                f"{self.layer_name}: {type(self.quant_method).__name__} has no "
-                "weight_scale_name; vllm-expert-pager only knows how to stage FP8 "
-                "scales"
-            )
+            # NVFP4 uses "weight_scale" for block scales (w13_weight_scale, w2_weight_scale)
+            if type(self.quant_method).__name__ == "ModelOptNvFp4FusedMoE":
+                scale_name = "weight_scale"
+            else:
+                raise RuntimeError(
+                    f"{self.layer_name}: {type(self.quant_method).__name__} has no "
+                    "weight_scale_name; vllm-expert-pager only knows how to stage FP8 "
+                    "scales"
+                )
         # Same order as PARAMS (w13, w2). gather takes two-element lists in this
         # order.
         self._expert_pager_scale_names = [f"{w}_{scale_name}" for w in ("w13", "w2")]
@@ -354,14 +408,17 @@ class ExpertPagerRoutedExperts(RoutedExperts):
         self._expert_pager_prefill_staging = _prefill_staging
         self._expert_pager_params = staged
         # Prefill intercepts moe_sum to take the top-k sum once across the
-        # chunks (_expert_pager_forward_working). Only TritonExperts'
-        # moe_sum(cache3, output) is known.
+        # chunks (_expert_pager_forward_working). Both TritonExperts and
+        # FlashInferExperts have compatible moe_sum(self, input, output) signatures.
         experts = self.quant_method.moe_kernel.fused_experts
-        if getattr(type(experts), "moe_sum", None) is not TritonExperts.moe_sum:
-            raise RuntimeError(
-                f"{self.layer_name}: vllm-expert-pager chunks the prefill through "
-                f"TritonExperts.moe_sum, but the kernel is {type(experts).__name__}"
-            )
+        moe_sum_fn = getattr(type(experts), "moe_sum", None)
+        if moe_sum_fn is None or moe_sum_fn not in (TritonExperts.moe_sum,):
+            # Check for FlashInferExperts by name since we can't easily import it here
+            if "FlashInferExperts" not in type(experts).__name__:
+                raise RuntimeError(
+                    f"{self.layer_name}: vllm-expert-pager chunks the prefill through "
+                    f"moe_sum, but the kernel {type(experts).__name__} has no compatible moe_sum"
+                )
         self._expert_pager_experts = experts
 
         logger.info_once(
