@@ -292,12 +292,28 @@ class ExpertPagerRoutedExperts(RoutedExperts):
                 backend_v in ("FLASHINFER_CUTLASS", "FLASHINFER_TRTLLM", "FLASHINFER_B12X")
                 and getattr(self.moe_config, "is_act_and_mul", True)
             )
+            # DEBUG: log the actual values at load time
+            import sys as _sys
+            print(
+                f"PAGERDBG WLOAD: quant_method={type(self.quant_method).__name__} "
+                f"backend={backend!r} backend_v={backend_v!r} "
+                f"is_act_and_mul={getattr(self.moe_config, 'is_act_and_mul', 'MISSING')} "
+                f"shard_id={shard_id} expert_id={expert_id} fi_w3w1={fi_w3w1}",
+                file=_sys.stderr, flush=True,
+            )
             half = (N if shard_id == "w1" else 0) if fi_w3w1 else (0 if shard_id == "w1" else N)
             buf[half : half + N].copy_(loaded_weight)
             seen.add(shard_id)
             if seen != {"w1", "w3"}:
                 return True if return_success else None
             del self._expert_pager_stage[expert_id]
+            import sys as _sys
+            print(
+                f"PAGERDBG WLOAD_WRITE: layer={self._expert_pager_layer} expert={expert_id} "
+                f"buf_sum={int(buf.view(torch.int32).to(torch.int64).sum().item())} "
+                f"buf_shape={tuple(buf.shape)}",
+                file=_sys.stderr, flush=True,
+            )
             self._expert_pager_store.write(
                 self._expert_pager_layer, expert_id, "w13_weight", buf
             )
