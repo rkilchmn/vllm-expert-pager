@@ -592,6 +592,10 @@ class Store:
             words = record.view(torch.int32).cpu()
         else:
             words = raw.view(torch.int32)
+            if words.is_cuda:
+                # Converted (kernel-format) rows arrive on the device; the file
+                # write and the pinned RAM row both live on the host.
+                words = words.cpu()
         if expert < self.ram_slots:
             self.pinned[name][layer * self.ram_slots + expert].copy_(words)
         if self.fd_w is not None:

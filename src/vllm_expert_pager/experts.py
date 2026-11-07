@@ -19,6 +19,8 @@ compressed, and the GPU expands them when copying into VRAM.
 """
 
 import os
+import sys
+import time
 
 import torch
 from vllm.config import get_current_vllm_config
@@ -85,6 +87,46 @@ WORKING_ROWS = int(os.environ.get("VLLM_EXPERT_PAGER_WORKING_ROWS", "64"))
 # when forward is called eagerly (prefill etc.). The counters themselves live
 # on the device and include replays.
 LOG_INTERVAL = int(os.environ.get("VLLM_EXPERT_PAGER_LOG_INTERVAL", "1000"))
+
+# Debug verbosity per plugin (0 = default/off). Legacy boolean
+# VLLM_EXPERT_PAGER_DEBUG maps to level 1.
+#   0 - no debug output (default)
+#   1 - per-forward path summary: decode vs working path, K, chunks, wall ms
+#   2 - + checksums of the slab rows handed to the MoE kernel (weights, block
+#       scales) and expert_map coverage (slot<-global samples) per call
+#   3 - + per-chunk detail in the working path
+DEBUG_LEVEL = int(os.environ.get("VLLM_EXPERT_PAGER_DEBUG_LEVEL", "0"))
+if DEBUG_LEVEL <= 0 and os.environ.get("VLLM_EXPERT_PAGER_DEBUG", ""):
+    DEBUG_LEVEL = 1
+
+_pager_dbg_calls = 0
+
+
+def _dbg(level: int) -> bool:
+    """Opt-in debug gate; also avoids logging inside CUDA graph capture."""
+    global _pager_dbg_calls
+    if DEBUG_LEVEL < level:
+        return False
+    _pager_dbg_calls += 1
+    if torch.cuda.is_current_stream_capturing():
+        return False
+    return True
+
+
+def _dbg_line(msg: str) -> None:
+    print(f"PAGERDBG: {msg}", file=sys.stderr, flush=True)
+
+
+def _t32_sum(t: torch.Tensor) -> int:
+    try:
+        flat = t.reshape(-1)
+        if (n := flat.numel()) % 4:
+            flat = torch.cat(
+                [flat, torch.zeros(4 - n % 4, dtype=flat.dtype, device=flat.device)]
+            )
+        return int(flat.view(torch.int32).to(torch.int64).sum().item())
+    except Exception:
+        return -1
 
 # Expert weights referenced through the slab. Scales stay resident in VRAM and
 # a copy in slot order is shown alongside the weights.
@@ -287,6 +329,11 @@ class ExpertPagerRoutedExperts(RoutedExperts):
 
         store = self._expert_pager_store
         params = {name: getattr(self, name) for name in PARAMS}
+        # The load-time records written by weight_loader hold the layout the
+        # MoE kernel reads. The loading parameter must NOT be used as a
+        # source here: the pager replaced the weights with a stride-0 expand
+        # before loading (VRAM saver), so the parameter never held per-expert
+        # rows and the conversion ran on that expand as well.
         for name, p in params.items():
             # Undo the expand and shrink back to one row. The leading slice is
             # contiguous, so contiguous() would not copy and the original
@@ -452,10 +499,19 @@ class ExpertPagerRoutedExperts(RoutedExperts):
         # Choose the path from the shape alone, so capture and replay of the
         # graph take the same path.
         if topk_ids.numel() > vram.num_slots:
-            return self._expert_pager_forward_working(
+            t0 = time.perf_counter() if DEBUG_LEVEL >= 1 else 0.0
+            out = self._expert_pager_forward_working(
                 x, topk_weights, topk_ids, shared_experts, shared_experts_input
             )
+            if DEBUG_LEVEL >= 1:
+                torch.cuda.synchronize()
+                _dbg_line(
+                    f"{self.layer_name} working: {(time.perf_counter() - t0) * 1e3:.2f} ms "
+                    f"ids={topk_ids.numel()} shape={tuple(x.shape)}"
+                )
+            return out
 
+        t0 = time.perf_counter() if DEBUG_LEVEL >= 1 else 0.0
         # Decode. Both tables are updated by one kernel, and expert_map is
         # written directly into self._expert_pager_map. The RAM tier follows the
         # same rule as the VRAM tier and is touched every step, so RAM stays a
@@ -504,10 +560,17 @@ class ExpertPagerRoutedExperts(RoutedExperts):
             )  # fmt: skip
 
         self._expert_pager_log()
-        return self._expert_pager_run(
+        out = self._expert_pager_run(
             self._expert_pager_cache_slab, x, topk_weights, topk_ids,
             shared_experts, shared_experts_input,
         )  # fmt: skip
+        if DEBUG_LEVEL >= 1:
+            torch.cuda.synchronize()
+            _dbg_line(
+                f"{self.layer_name} decode: {(time.perf_counter() - t0) * 1e3:.2f} ms "
+                f"ids={topk_ids.numel()} shape={tuple(x.shape)}"
+            )
+        return out
 
     def _expert_pager_forward_working(
         self,
@@ -648,6 +711,8 @@ class ExpertPagerRoutedExperts(RoutedExperts):
             for name, param in self._expert_pager_params.items():
                 param.data = slabs[name]
             self._expert_pager_expert_map = self._expert_pager_map
+            if DEBUG_LEVEL >= 2:
+                self._expert_pager_dbg_slab(slabs)
             return super().forward_modular(
                 x=x,
                 topk_weights=topk_weights,
@@ -666,6 +731,36 @@ class ExpertPagerRoutedExperts(RoutedExperts):
             f"but {type(self.quant_method).__name__} is monolithic. Expert weights "
             "would not be staged."
         )
+
+    def _expert_pager_dbg_slab(self, slabs: dict[str, torch.Tensor]) -> None:
+        """Level-2 debug: what the pager hands to the MoE kernel for this call.
+
+        Checksums cover the exactly-4-byte-viewable rows (weights + block
+        scales in slot order) plus the per-expert global-scale tables (the
+        kernel reindexes them into slot order using expert_map), so the
+        MOEKDBG rank lines of the same step can be cross-checked.
+        """
+        parts = []
+        for n in PARAMS + tuple(self._expert_pager_scale_names):
+            t = slabs.get(n)
+            parts.append(f"{n}={_t32_sum(t) if t is not None else 'NA'}")
+        for n in ("w13_weight_scale_2", "w2_weight_scale_2"):
+            t = getattr(self, n, None)
+            if isinstance(t, torch.Tensor):
+                parts.append(f"{n}={_t32_sum(t)}")
+        m = self._expert_pager_map
+        valid = torch.nonzero(m >= 0, as_tuple=False).flatten()
+        if valid.numel():
+            pairs = sorted(
+                range(int(valid.numel())),
+                key=lambda i: int(m[valid[i]].item()),
+            )
+            sample = [(int(valid[pairs[i]]), int(m[valid[pairs[i]]])) for i in range(min(8, len(pairs)))]
+            parts.append(f"map mapped={int(valid.numel())} slot<-global={sample}")
+        else:
+            parts.append("map mapped=0")
+        _dbg_line(f"{self.layer_name} run slab-checksums " + " ".join(parts))
+
 
     def _expert_pager_log(self) -> None:
         self._expert_pager_calls += 1
