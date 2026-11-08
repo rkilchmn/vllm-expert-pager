@@ -727,15 +727,68 @@ class ExpertPagerRoutedExperts(RoutedExperts):
             for name, param in self._expert_pager_params.items():
                 param.data = slabs[name]
             self._expert_pager_expert_map = self._expert_pager_map
+
+            # The MoE kernel indexes every per-expert table (weights, block
+            # scales, alphas) with the ids it is given, and the tables hold the
+            # experts of this step only: S slab rows on the decode path, W
+            # working rows on the prefill path. The router hands us *global*
+            # expert ids, so they must be rewritten to row numbers through
+            # expert_map (global -> row, -1 for experts not in this pass). The
+            # FlashInfer kernels keep only ids inside [0, rows) and silently
+            # drop the rest, so passing global ids made 9 of 10 experts per
+            # token vanish (~zero routed output). Ids that map to -1 are the
+            # experts of another prefill chunk and are meant to be dropped.
+            emap = self._expert_pager_map
+            run_ids = topk_ids
+            if emap is not None and emap.numel() >= self.global_num_experts:
+                # index_select asserts on out-of-range ids, and a -1 here means
+                # "no expert" (must stay -1 so the kernel drops it).
+                flat = topk_ids.reshape(-1).to(torch.long)
+                ok = (flat >= 0) & (flat < emap.numel())
+                safe = torch.where(ok, flat, torch.zeros_like(flat))
+                rows = emap.to(torch.long).index_select(0, safe)
+                rows = torch.where(ok, rows, torch.full_like(rows, -1))
+                run_ids = rows.reshape(topk_ids.shape).to(topk_ids.dtype)  # fmt: skip
+
             if DEBUG_LEVEL >= 2:
                 self._expert_pager_dbg_slab(slabs)
-            return super().forward_modular(
+            if DEBUG_LEVEL >= 3:
+                # ids must now be row numbers inside the tables (0..n_slots-1
+                # for decode); global ids here mean the renumbering is broken
+                # and the kernel will drop the tokens.
+                _g = topk_ids.reshape(-1)
+                _ids = run_ids.reshape(-1)
+                _n = slabs["w13_weight"].shape[0]
+                _x = x.reshape(-1)
+                _dbg_line(
+                    f"{self.layer_name} RUNINPUT n_rows={_n} ids={_ids.numel()} "
+                    f"gids_min={int(_g.min())} gids_max={int(_g.max())} "
+                    f"gids_head={_g[:10].tolist()} "
+                    f"rows_head={_ids[:10].tolist()} "
+                    f"rows_min={int(_ids.min())} rows_max={int(_ids.max())} "
+                    f"rows_oob={int((_ids >= _n).sum())} "
+                    f"rows_neg={int((_ids < 0).sum())} "
+                    f"x_sum={_t32_sum(_x)} x_absmax={float(_x.abs().max()):.6g}"
+                )
+            _out = super().forward_modular(
                 x=x,
                 topk_weights=topk_weights,
-                topk_ids=topk_ids,
+                topk_ids=run_ids,
                 shared_experts=shared_experts,
                 shared_experts_input=shared_experts_input,
             )
+            if DEBUG_LEVEL >= 3:
+                _o = _out.reshape(-1)
+                _xf = x.float().reshape(-1)
+                _of = _out.float().reshape(-1)
+                _dbg_line(
+                    f"{self.layer_name} RUNOUT out_sum={_t32_sum(_o)} "
+                    f"out_absmax={float(_of.abs().max()):.6g} "
+                    f"out_rms={float(_of.pow(2).mean().sqrt()):.6g} "
+                    f"x_rms={float(_xf.pow(2).mean().sqrt()):.6g} "
+                    f"zero_frac={float((_of == 0).float().mean()):.4f}"
+                )
+            return _out
         finally:
             self._expert_pager_expert_map = None
             for name, data in saved.items():
