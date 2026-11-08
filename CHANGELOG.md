@@ -1,5 +1,7 @@
 # Changelog
 
+## [0.1.1](https://github.com/rkilchmn/vllm-expert-pager/commits/0.1.1) - 2026-11-08
+
 ## [0.1.1](https://github.com/monochromegane/vllm-expert-pager/compare/0.1.0...0.1.1) - 2026-09-18
 
 - Perf/ssd tier by @monochromegane in https://github.com/monochromegane/vllm-expert-pager/pull/2
